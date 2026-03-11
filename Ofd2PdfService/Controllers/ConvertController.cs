@@ -1,5 +1,6 @@
+using iText.Kernel.Colors;
 using iText.Kernel.Pdf;
-using iText.Kernel.Pdf.Annot;
+using iText.Kernel.Pdf.Canvas;
 using Microsoft.AspNetCore.Mvc;
 using Spire.Pdf.Conversion;
 
@@ -98,7 +99,8 @@ public class ConvertController : ControllerBase
     }
 
     /// <summary>
-    /// Removes the Spire.PDF evaluation warning annotation from all pages of a PDF file.
+    /// Removes the Spire.PDF evaluation warning from all pages of a PDF file by painting a white
+    /// rectangle over the top of each page, covering the warning strip in the content stream.
     /// </summary>
     private static void RemoveEvaluationWarning(string pdfPath, ILogger logger)
     {
@@ -109,20 +111,22 @@ public class ConvertController : ControllerBase
             using (var writer = new PdfWriter(tempPath))
             using (var doc = new PdfDocument(reader, writer))
             {
+                // Spire.PDF (FreeSpire) renders a ~30-point-tall evaluation warning strip
+                // at the top of every page as part of the page content stream.
+                // Cover it by drawing a white rectangle on top of each page.
+                const float warningHeight = 30f;
                 for (int i = 1; i <= doc.GetNumberOfPages(); i++)
                 {
                     var page = doc.GetPage(i);
-                    var annotations = page.GetAnnotations();
-                    for (int j = annotations.Count - 1; j >= 0; j--)
-                    {
-                        var annotation = annotations[j];
-                        var contents = annotation.GetContents();
-                        if (contents != null &&
-                            contents.GetValue().IndexOf("Evaluation Warning", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            page.RemoveAnnotation(annotation);
-                        }
-                    }
+                    var pageSize = page.GetPageSize();
+                    var canvas = new PdfCanvas(page.NewContentStreamAfter(), page.GetResources(), doc);
+                    canvas.SaveState()
+                          .SetFillColor(ColorConstants.WHITE)
+                          .Rectangle(pageSize.GetLeft(), pageSize.GetTop() - warningHeight,
+                                     pageSize.GetWidth(), warningHeight)
+                          .Fill()
+                          .RestoreState()
+                          .Release();
                 }
             }
             System.IO.File.Move(tempPath, pdfPath, overwrite: true);
