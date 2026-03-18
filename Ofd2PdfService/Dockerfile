@@ -7,7 +7,7 @@ RUN dotnet restore "Ofd2PdfService.csproj"
 COPY . .
 RUN dotnet publish "Ofd2PdfService.csproj" -c Release -o /app/publish --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:6.0 AS runtime
+FROM registry.yygu.cn/library/dotnet_aspnet:6.0 AS runtime
 WORKDIR /app
 
 # Install native font/image dependencies and Chinese fonts required by Spire.PDF on Linux
