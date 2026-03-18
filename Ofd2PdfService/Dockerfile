@@ -10,11 +10,15 @@ RUN dotnet publish "Ofd2PdfService.csproj" -c Release -o /app/publish --no-resto
 FROM mcr.microsoft.com/dotnet/aspnet:6.0 AS runtime
 WORKDIR /app
 
-# Install native font/image dependencies required by Spire.PDF on Linux
+# Install native font/image dependencies and Chinese fonts required by Spire.PDF on Linux
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     libgdiplus \
     libc6-dev \
+    fonts-noto-cjk \
+    fonts-wqy-zenhei \
+    fonts-wqy-microhei \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/publish .
