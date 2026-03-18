@@ -210,7 +210,12 @@ public class ConvertController : ControllerBase
             .Select(p =>
             {
                 var baseLoc = p.Attribute("BaseLoc")!.Value.Replace('\\', '/').TrimStart('/');
-                return (string.IsNullOrEmpty(docFolder) ? baseLoc : $"{docFolder}/{baseLoc}") + "/";
+                // BaseLoc may point to a content file (e.g. Pages/Page_0/Content.xml) or a
+                // directory (e.g. Pages/Page_0).  Derive the directory so that StartsWith
+                // matching covers all files inside that page folder.
+                var pageDir = baseLoc.Contains('/') ? baseLoc[..baseLoc.LastIndexOf('/')] : baseLoc;
+                var fullDir = string.IsNullOrEmpty(docFolder) ? pageDir : $"{docFolder}/{pageDir}";
+                return fullDir + "/";
             })
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
