@@ -238,10 +238,14 @@ public class ConvertController : ControllerBase
         // CFF data.  FreeSpire.PDF uses the file extension to determine how to parse a
         // font: passing raw CFF bytes to its OTF parser causes a NullReferenceException.
         // Renaming such files to .cff lets Spire.PDF parse them correctly.
+        // In addition, some raw CFF fonts use CFF Expert Encoding whose glyph lookup
+        // triggers a NullReferenceException deep inside Spire.PDF's CFF renderer even
+        // after renaming.  For those fonts we also strip all TextObject elements that
+        // reference them from the page content, suppressing the crash.
         // Both PublicRes and DocumentRes resource files are scanned.
         var resourcePaths = GetResourcePaths(docXml, docFolder);
         var resourcePathSet = new HashSet<string>(resourcePaths, StringComparer.OrdinalIgnoreCase);
-        var fontRenameMap = BuildRawCffFontRenameMap(src, resourcePaths);
+        var (fontRenameMap, rawCffFontIds) = BuildRawCffFontInfo(src, resourcePaths);
 
         using var dest = ZipFile.Open(destPath, ZipArchiveMode.Create);
 
@@ -301,6 +305,30 @@ public class ConvertController : ControllerBase
                 using var srcStream = entry.Open();
                 srcStream.CopyTo(destStream);
             }
+            else if (rawCffFontIds.Count > 0 &&
+                     includedPrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) &&
+                     name.EndsWith("/Content.xml", StringComparison.OrdinalIgnoreCase))
+            {
+                // Strip any TextObject elements whose Font attribute refers to a raw CFF
+                // font that Spire.PDF cannot render without crashing.  Renaming the font
+                // file to .cff is insufficient for some CFF fonts (e.g. those using Expert
+                // Encoding): Spire.PDF's raw-CFF renderer still throws NullReferenceException.
+                // Removing the offending TextObjects prevents the crash; the rest of the
+                // page content (images, paths, other text) is preserved intact.
+                XDocument contentXml;
+                using (var srcStream = entry.Open())
+                    contentXml = XDocument.Load(srcStream);
+
+                var toRemove = contentXml.Descendants()
+                    .Where(e => e.Name.LocalName == "TextObject" &&
+                                rawCffFontIds.Contains((string?)e.Attribute("Font") ?? ""))
+                    .ToList();
+                foreach (var el in toRemove)
+                    el.Remove();
+
+                using var destStream = dest.CreateEntry(name).Open();
+                contentXml.Save(destStream);
+            }
             else
             {
                 using var destStream = dest.CreateEntry(name).Open();
@@ -348,15 +376,21 @@ public class ConvertController : ControllerBase
 
     /// <summary>
     /// Reads one or more resource XML files (PublicRes / DocumentRes) from the source
-    /// archive and returns a mapping from the original archive path of each font file
-    /// whose name ends in ".otf" but whose content is raw CFF data (not a proper
-    /// OTF/TrueType container) to its corrected ".cff" archive path.
-    /// An empty dictionary is returned when no such fonts exist.
+    /// archive and returns:
+    /// <list type="bullet">
+    ///   <item>a mapping from the original archive path of each font file whose name ends
+    ///   in ".otf" but whose content is raw CFF data (not a proper OTF/TrueType container)
+    ///   to its corrected ".cff" archive path; and</item>
+    ///   <item>the set of Font element IDs (e.g. "764") for those raw-CFF fonts, used to
+    ///   strip problematic TextObject elements from page content.</item>
+    /// </list>
+    /// Both collections are empty when no such fonts exist.
     /// </summary>
-    private static Dictionary<string, string> BuildRawCffFontRenameMap(
-        ZipArchive src, IEnumerable<string> resourcePaths)
+    private static (Dictionary<string, string> RenameMap, HashSet<string> RawCffFontIds)
+        BuildRawCffFontInfo(ZipArchive src, IEnumerable<string> resourcePaths)
     {
         var renameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var rawCffFontIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var resourcePath in resourcePaths)
         {
@@ -372,9 +406,13 @@ public class ConvertController : ControllerBase
             var baseLoc = resXml.Root?.Attribute("BaseLoc")?.Value?.Trim().Replace('\\', '/') ?? "";
             var fontBasePath = CombinePaths(resFolder, baseLoc);
 
-            foreach (var fontFileEl in resXml.Descendants()
-                .Where(e => e.Name.LocalName == "FontFile"))
+            foreach (var fontEl in resXml.Descendants()
+                .Where(e => e.Name.LocalName == "Font"))
             {
+                var fontFileEl = fontEl.Descendants()
+                    .FirstOrDefault(e => e.Name.LocalName == "FontFile");
+                if (fontFileEl == null) continue;
+
                 var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
                 if (!fontFileName.EndsWith(".otf", StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -399,11 +437,15 @@ public class ConvertController : ControllerBase
                     (header[0] == 0x4F && header[1] == 0x54 && header[2] == 0x54 && header[3] == 0x4F);
 
                 if (!isOtfContainer)
+                {
                     renameMap[fullFontPath] = fullFontPath[..^4] + ".cff";
+                    var fontId = fontEl.Attribute("ID")?.Value;
+                    if (fontId != null) rawCffFontIds.Add(fontId);
+                }
             }
         }
 
-        return renameMap;
+        return (renameMap, rawCffFontIds);
     }
 
     /// <summary>
