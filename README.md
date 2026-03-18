@@ -2,12 +2,6 @@
 
 Convert OFD files to PDF files.
 
-## GUI（Windows）
-
-![Ofd2Pdf GUI](screenshot.png)
-
-你可以单击打开 GUI，选择文件或者拖拽文件到列表，亦或者简单将文件拖拽到可执行文件上，它将自动完成转换过程。
-
 ## HTTP API 服务（Linux / .NET 8）
 
 `Ofd2PdfService` 是一个基于 ASP.NET Core 8 的 HTTP 接口服务，可运行在 Linux 服务器上，通过接口将 OFD 文件转换为 PDF。
