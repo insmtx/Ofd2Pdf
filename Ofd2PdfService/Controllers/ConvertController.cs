@@ -170,6 +170,9 @@ public class ConvertController : ControllerBase
     /// Creates a sub-OFD ZIP file containing only the specified page range.
     /// All non-page entries (resources, fonts, etc.) are copied as-is so that
     /// each sub-OFD is a valid, self-contained document.
+    /// Font files with a .otf extension that actually contain raw CFF data (not a
+    /// proper OTF container) are renamed to .cff to prevent FreeSpire.PDF from
+    /// misidentifying them and throwing a NullReferenceException during conversion.
     /// </summary>
     private static void CreateSubOfd(string sourcePath, string destPath, int startPage, int pageCount)
     {
@@ -219,6 +222,13 @@ public class ConvertController : ControllerBase
             })
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // Build a rename map for font files that have a .otf extension but contain raw
+        // CFF data.  FreeSpire.PDF uses the file extension to determine how to parse a
+        // font: passing raw CFF bytes to its OTF parser causes a NullReferenceException.
+        // Renaming such files to .cff lets Spire.PDF parse them correctly.
+        var publicResPath = GetPublicResPath(docXml, docFolder);
+        var fontRenameMap = BuildRawCffFontRenameMap(src, publicResPath);
+
         using var dest = ZipFile.Open(destPath, ZipArchiveMode.Create);
 
         foreach (var entry in src.Entries)
@@ -243,6 +253,40 @@ public class ConvertController : ControllerBase
                 using var destStream = dest.CreateEntry(name).Open();
                 modifiedDoc.Save(destStream);
             }
+            else if (publicResPath != null &&
+                     name.Equals(publicResPath, StringComparison.OrdinalIgnoreCase) &&
+                     fontRenameMap.Count > 0)
+            {
+                // Write a modified PublicRes.xml with updated font file names
+                XDocument pubResXml;
+                using (var srcStream = entry.Open())
+                    pubResXml = XDocument.Load(srcStream);
+
+                var baseLoc = pubResXml.Root?.Attribute("BaseLoc")?.Value?.Trim().Replace('\\', '/') ?? "";
+                var fontBasePath = CombinePaths(docFolder, baseLoc);
+
+                foreach (var fontFileEl in pubResXml.Descendants()
+                    .Where(e => e.Name.LocalName == "FontFile"))
+                {
+                    var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
+                    var fullFontPath = CombinePaths(fontBasePath, fontFileName);
+                    if (fontRenameMap.TryGetValue(fullFontPath, out var newFullPath))
+                    {
+                        int sep = newFullPath.LastIndexOf('/');
+                        fontFileEl.Value = sep >= 0 ? newFullPath[(sep + 1)..] : newFullPath;
+                    }
+                }
+
+                using var destStream = dest.CreateEntry(name).Open();
+                pubResXml.Save(destStream);
+            }
+            else if (fontRenameMap.TryGetValue(name, out var renamedPath))
+            {
+                // Copy a font file under its corrected .cff name
+                using var destStream = dest.CreateEntry(renamedPath).Open();
+                using var srcStream = entry.Open();
+                srcStream.CopyTo(destStream);
+            }
             else
             {
                 using var destStream = dest.CreateEntry(name).Open();
@@ -250,6 +294,86 @@ public class ConvertController : ControllerBase
                 srcStream.CopyTo(destStream);
             }
         }
+    }
+
+    /// <summary>
+    /// Returns the archive path of PublicRes.xml declared in Document.xml, or null if absent.
+    /// </summary>
+    private static string? GetPublicResPath(XDocument docXml, string docFolder)
+    {
+        var rel = docXml.Descendants()
+            .FirstOrDefault(e => e.Name.LocalName == "PublicRes")
+            ?.Value.Trim().Replace('\\', '/');
+        return string.IsNullOrEmpty(rel) ? null : CombinePaths(docFolder, rel);
+    }
+
+    /// <summary>
+    /// Combines two path segments, omitting a separator when either part is empty.
+    /// </summary>
+    private static string CombinePaths(string prefix, string suffix)
+    {
+        if (string.IsNullOrEmpty(prefix)) return suffix;
+        if (string.IsNullOrEmpty(suffix)) return prefix;
+        return $"{prefix}/{suffix}";
+    }
+
+    /// <summary>
+    /// Reads PublicRes.xml from the source archive and returns a mapping from the
+    /// original archive path of each font file whose name ends in ".otf" but whose
+    /// content is raw CFF data (not a proper OTF/TrueType container) to its corrected
+    /// ".cff" archive path.  An empty dictionary is returned when no such fonts exist.
+    /// </summary>
+    private static Dictionary<string, string> BuildRawCffFontRenameMap(
+        ZipArchive src, string? publicResPath)
+    {
+        var renameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (publicResPath == null) return renameMap;
+
+        var pubResEntry = src.Entries.FirstOrDefault(
+            e => e.FullName.Replace('\\', '/').Equals(publicResPath, StringComparison.OrdinalIgnoreCase));
+        if (pubResEntry == null) return renameMap;
+
+        XDocument pubResXml;
+        using (var stream = pubResEntry.Open())
+            pubResXml = XDocument.Load(stream);
+
+        var docFolder = publicResPath.Contains('/')
+            ? publicResPath[..publicResPath.LastIndexOf('/')]
+            : "";
+        var baseLoc = pubResXml.Root?.Attribute("BaseLoc")?.Value?.Trim().Replace('\\', '/') ?? "";
+        var fontBasePath = CombinePaths(docFolder, baseLoc);
+
+        foreach (var fontFileEl in pubResXml.Descendants()
+            .Where(e => e.Name.LocalName == "FontFile"))
+        {
+            var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
+            if (!fontFileName.EndsWith(".otf", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var fullFontPath = CombinePaths(fontBasePath, fontFileName);
+            var fontEntry = src.Entries.FirstOrDefault(
+                e => e.FullName.Replace('\\', '/').Equals(fullFontPath, StringComparison.OrdinalIgnoreCase));
+            if (fontEntry == null) continue;
+
+            // Read just the first 4 bytes to detect the file type.
+            // A proper OTF/TrueType container starts with 00 01 00 00 (TrueType) or
+            // 4F 54 54 4F ("OTTO", CFF-based OpenType).  Anything else is treated as
+            // raw CFF data with a misleading extension.
+            var header = new byte[4];
+            using (var fs = fontEntry.Open())
+            {
+                if (fs.Read(header, 0, 4) < 4) continue;
+            }
+
+            bool isOtfContainer =
+                (header[0] == 0x00 && header[1] == 0x01 && header[2] == 0x00 && header[3] == 0x00) ||
+                (header[0] == 0x4F && header[1] == 0x54 && header[2] == 0x54 && header[3] == 0x4F);
+
+            if (!isOtfContainer)
+                renameMap[fullFontPath] = fullFontPath[..^4] + ".cff";
+        }
+
+        return renameMap;
     }
 
     /// <summary>
