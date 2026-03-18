@@ -6,6 +6,8 @@ using iText.Kernel.Pdf.Canvas.Parser.Data;
 using iText.Kernel.Pdf.Canvas.Parser.Listener;
 using Microsoft.AspNetCore.Mvc;
 using Spire.Pdf.Conversion;
+using System.IO.Compression;
+using System.Xml.Linq;
 using ITextRect = iText.Kernel.Geom.Rectangle;
 
 namespace Ofd2PdfService.Controllers;
@@ -75,8 +77,7 @@ public class ConvertController : ControllerBase
             }
 
             _logger.LogInformation("Converting {FileName} to PDF", file.FileName);
-            var converter = new OfdConverter(inputPath);
-            converter.ToPdf(outputPath);
+            ConvertOfdToPdf(inputPath, outputPath);
             RemoveEvaluationWarning(outputPath, _logger);
 
             var pdfBytes = await System.IO.File.ReadAllBytesAsync(outputPath);
@@ -99,6 +100,171 @@ public class ConvertController : ControllerBase
         {
             try { Directory.Delete(tmpDir, recursive: true); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to clean up temp directory {TmpDir}", tmpDir); }
+        }
+    }
+
+    /// <summary>
+    /// Converts an OFD file to PDF, splitting it into batches of up to 3 pages to work
+    /// around the FreeSpire.PDF evaluation version page limit, then merging the results.
+    /// </summary>
+    private static void ConvertOfdToPdf(string inputPath, string outputPath)
+    {
+        int totalPages;
+        try { totalPages = GetOfdPageCount(inputPath); }
+        catch { totalPages = 0; }
+
+        if (totalPages <= 3)
+        {
+            new OfdConverter(inputPath).ToPdf(outputPath);
+            return;
+        }
+
+        var tmpDir = Path.Combine(Path.GetTempPath(), "ofd2pdf_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            var partPdfs = new List<string>();
+            for (int start = 0; start < totalPages; start += 3)
+            {
+                var partOfd = Path.Combine(tmpDir, $"part_{start}.ofd");
+                var partPdf = Path.Combine(tmpDir, $"part_{start}.pdf");
+                CreateSubOfd(inputPath, partOfd, start, Math.Min(3, totalPages - start));
+                new OfdConverter(partOfd).ToPdf(partPdf);
+                partPdfs.Add(partPdf);
+            }
+            MergePdfs(partPdfs, outputPath);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Returns the total number of pages in an OFD file by reading its Document.xml.
+    /// </summary>
+    private static int GetOfdPageCount(string ofdPath)
+    {
+        using var archive = ZipFile.OpenRead(ofdPath);
+
+        var ofdXmlEntry = archive.Entries.FirstOrDefault(
+            e => e.FullName.Equals("OFD.xml", StringComparison.OrdinalIgnoreCase));
+        if (ofdXmlEntry == null) return 0;
+
+        string docRootPath;
+        using (var stream = ofdXmlEntry.Open())
+            docRootPath = XDocument.Load(stream).Descendants()
+                .First(e => e.Name.LocalName == "DocRoot")
+                .Value.Trim().Replace('\\', '/');
+
+        var docEntry = archive.Entries.FirstOrDefault(
+            e => e.FullName.Replace('\\', '/').Equals(docRootPath, StringComparison.OrdinalIgnoreCase));
+        if (docEntry == null) return 0;
+
+        using var docStream = docEntry.Open();
+        return XDocument.Load(docStream).Descendants()
+            .Count(e => e.Name.LocalName == "Page" && e.Attribute("BaseLoc") != null);
+    }
+
+    /// <summary>
+    /// Creates a sub-OFD ZIP file containing only the specified page range.
+    /// All non-page entries (resources, fonts, etc.) are copied as-is so that
+    /// each sub-OFD is a valid, self-contained document.
+    /// </summary>
+    private static void CreateSubOfd(string sourcePath, string destPath, int startPage, int pageCount)
+    {
+        using var src = ZipFile.OpenRead(sourcePath);
+
+        var ofdXmlEntry = src.Entries.First(
+            e => e.FullName.Equals("OFD.xml", StringComparison.OrdinalIgnoreCase));
+
+        string docRootPath;
+        using (var stream = ofdXmlEntry.Open())
+            docRootPath = XDocument.Load(stream).Descendants()
+                .First(e => e.Name.LocalName == "DocRoot")
+                .Value.Trim().Replace('\\', '/');
+
+        var docFolder = docRootPath.Contains('/')
+            ? docRootPath[..docRootPath.LastIndexOf('/')]
+            : "";
+
+        XDocument docXml;
+        List<XElement> allPages;
+        var docEntry = src.Entries.First(
+            e => e.FullName.Replace('\\', '/').Equals(docRootPath, StringComparison.OrdinalIgnoreCase));
+        using (var stream = docEntry.Open())
+        {
+            docXml = XDocument.Load(stream);
+            allPages = docXml.Descendants()
+                .Where(e => e.Name.LocalName == "Page" && e.Attribute("BaseLoc") != null)
+                .ToList();
+        }
+
+        var selectedPages = allPages.Skip(startPage).Take(pageCount).ToList();
+
+        var pagesFolderPrefix = string.IsNullOrEmpty(docFolder)
+            ? "Pages/"
+            : $"{docFolder}/Pages/";
+
+        var includedPrefixes = selectedPages
+            .Select(p =>
+            {
+                var baseLoc = p.Attribute("BaseLoc")!.Value.Replace('\\', '/').TrimStart('/');
+                return (string.IsNullOrEmpty(docFolder) ? baseLoc : $"{docFolder}/{baseLoc}") + "/";
+            })
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        using var dest = ZipFile.Open(destPath, ZipArchiveMode.Create);
+
+        foreach (var entry in src.Entries)
+        {
+            var name = entry.FullName.Replace('\\', '/');
+            if (name.EndsWith("/")) continue; // skip directory entries
+
+            // Exclude pages that are not in the selected range
+            if (name.StartsWith(pagesFolderPrefix, StringComparison.OrdinalIgnoreCase) &&
+                !includedPrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            if (name.Equals(docRootPath, StringComparison.OrdinalIgnoreCase))
+            {
+                // Write a modified Document.xml referencing only the selected pages
+                var modifiedDoc = new XDocument(docXml);
+                var pagesEl = modifiedDoc.Descendants().First(e => e.Name.LocalName == "Pages");
+                pagesEl.RemoveNodes();
+                foreach (var page in selectedPages)
+                    pagesEl.Add(new XElement(page));
+
+                using var destStream = dest.CreateEntry(name).Open();
+                modifiedDoc.Save(destStream);
+            }
+            else
+            {
+                using var destStream = dest.CreateEntry(name).Open();
+                using var srcStream = entry.Open();
+                srcStream.CopyTo(destStream);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Merges multiple PDF files into a single output PDF using iText.
+    /// </summary>
+    private static void MergePdfs(IReadOnlyList<string> pdfPaths, string outputPath)
+    {
+        var readers = pdfPaths.Select(p => new PdfReader(p)).ToList();
+        var srcDocs = readers.Select(r => new PdfDocument(r)).ToList();
+        try
+        {
+            using var writer = new PdfWriter(outputPath);
+            using var mergedDoc = new PdfDocument(writer);
+            foreach (var srcDoc in srcDocs)
+                srcDoc.CopyPagesTo(1, srcDoc.GetNumberOfPages(), mergedDoc);
+        }
+        finally
+        {
+            foreach (var doc in srcDocs)
+                try { doc.Close(); } catch { }
         }
     }
 
