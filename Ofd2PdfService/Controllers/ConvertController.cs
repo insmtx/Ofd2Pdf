@@ -107,8 +107,9 @@ public class ConvertController : ControllerBase
     /// Converts an OFD file to PDF, splitting it into batches of up to 3 pages to work
     /// around the FreeSpire.PDF evaluation version page limit, then merging the results.
     /// A sanitized copy of the OFD is always created via <see cref="CreateSubOfd"/> before
-    /// conversion so that raw CFF fonts stored with a misleading .otf extension are renamed
-    /// to .cff — preventing a NullReferenceException inside Spire.PDF's OTF font parser.
+    /// conversion so that raw CFF fonts stored with a misleading .otf or .ttf extension are
+    /// renamed to .cff — preventing a NullReferenceException inside Spire.PDF's OTF/TrueType
+    /// font parser.
     /// </summary>
     private static void ConvertOfdToPdf(string inputPath, string outputPath)
     {
@@ -184,8 +185,8 @@ public class ConvertController : ControllerBase
     /// Creates a sub-OFD ZIP file containing only the specified page range.
     /// All non-page entries (resources, fonts, etc.) are copied as-is so that
     /// each sub-OFD is a valid, self-contained document.
-    /// Font files with a .otf extension that actually contain raw CFF data (not a
-    /// proper OTF container) are renamed to .cff to prevent FreeSpire.PDF from
+    /// Font files with a .otf or .ttf extension that actually contain raw CFF data (not a
+    /// proper OTF/TrueType container) are renamed to .cff to prevent FreeSpire.PDF from
     /// misidentifying them and throwing a NullReferenceException during conversion.
     /// </summary>
     private static void CreateSubOfd(string sourcePath, string destPath, int startPage, int pageCount)
@@ -379,8 +380,8 @@ public class ConvertController : ControllerBase
     /// archive and returns:
     /// <list type="bullet">
     ///   <item>a mapping from the original archive path of each font file whose name ends
-    ///   in ".otf" but whose content is raw CFF data (not a proper OTF/TrueType container)
-    ///   to its corrected ".cff" archive path; and</item>
+    ///   in ".otf" or ".ttf" but whose content is raw CFF data (not a proper OTF/TrueType
+    ///   container) to its corrected ".cff" archive path; and</item>
     ///   <item>the set of Font element IDs (e.g. "764") for those raw-CFF fonts, used to
     ///   strip problematic TextObject elements from page content.</item>
     /// </list>
@@ -414,7 +415,13 @@ public class ConvertController : ControllerBase
                 if (fontFileEl == null) continue;
 
                 var fontFileName = fontFileEl.Value.Trim().Replace('\\', '/');
-                if (!fontFileName.EndsWith(".otf", StringComparison.OrdinalIgnoreCase))
+
+                // Only inspect font file extensions that Spire.PDF may misparse when they
+                // actually contain raw CFF data.  Files already named .cff are passed to
+                // the CFF parser directly and do not need to be renamed.  Files with no
+                // extension or any other extension are left unchanged.
+                var fontExt = Path.GetExtension(fontFileName).ToLowerInvariant();
+                if (fontExt != ".otf" && fontExt != ".ttf")
                     continue;
 
                 var fullFontPath = CombinePaths(fontBasePath, fontFileName);
@@ -423,22 +430,30 @@ public class ConvertController : ControllerBase
                 if (fontEntry == null) continue;
 
                 // Read just the first 4 bytes to detect the file type.
-                // A proper OTF/TrueType container starts with 00 01 00 00 (TrueType) or
-                // 4F 54 54 4F ("OTTO", CFF-based OpenType).  Anything else is treated as
-                // raw CFF data with a misleading extension.
+                // Valid font-container signatures:
+                //   00 01 00 00  – TrueType / OpenType with TT outlines
+                //   4F 54 54 4F  – "OTTO" – CFF-based OpenType
+                //   74 72 75 65  – "true" – Apple TrueType
+                //   74 74 63 66  – "ttcf" – TrueType Collection
+                // Anything else is treated as raw CFF data stored with a misleading
+                // extension and must be renamed to .cff so that Spire.PDF uses its CFF
+                // parser instead of its OTF/TrueType parser (which throws
+                // NullReferenceException on raw CFF input).
                 var header = new byte[4];
                 using (var fs = fontEntry.Open())
                 {
                     if (fs.Read(header, 0, 4) < 4) continue;
                 }
 
-                bool isOtfContainer =
+                bool isValidFontContainer =
                     (header[0] == 0x00 && header[1] == 0x01 && header[2] == 0x00 && header[3] == 0x00) ||
-                    (header[0] == 0x4F && header[1] == 0x54 && header[2] == 0x54 && header[3] == 0x4F);
+                    (header[0] == 0x4F && header[1] == 0x54 && header[2] == 0x54 && header[3] == 0x4F) ||
+                    (header[0] == 0x74 && header[1] == 0x72 && header[2] == 0x75 && header[3] == 0x65) ||
+                    (header[0] == 0x74 && header[1] == 0x74 && header[2] == 0x63 && header[3] == 0x66);
 
-                if (!isOtfContainer)
+                if (!isValidFontContainer)
                 {
-                    renameMap[fullFontPath] = fullFontPath[..^4] + ".cff";
+                    renameMap[fullFontPath] = fullFontPath[..^fontExt.Length] + ".cff";
                     var fontId = fontEl.Attribute("ID")?.Value;
                     if (fontId != null) rawCffFontIds.Add(fontId);
                 }

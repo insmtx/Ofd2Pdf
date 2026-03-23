@@ -64,8 +64,37 @@ public class ConvertControllerTests : IClassFixture<WebApplicationFactory<Progra
     }
 
     /// <summary>
-    /// Posting a non-OFD file must return HTTP 400.
+    /// Posting sample2.ofd must succeed (HTTP 200) and return a non-empty PDF.
+    /// This file has 4 pages and embeds a font file named font_cff_as_ttf.ttf whose
+    /// content is raw CFF data (not a proper TrueType container).  Before the fix,
+    /// Spire.PDF's TrueType parser crashes with a NullReferenceException inside
+    /// OfdConverter's constructor when it encounters this font.  After the fix the font
+    /// is detected and renamed to .cff so the CFF parser is used instead.
     /// </summary>
+    [Fact]
+    public async Task Post_Sample2Ofd_ReturnsSuccessfulPdf()
+    {
+        var client = _factory.CreateClient();
+        var ofdPath = Path.Combine(TestDataDir, "sample2.ofd");
+        Assert.True(File.Exists(ofdPath), $"Test data not found: {ofdPath}");
+
+        using var content = new MultipartFormDataContent();
+        var fileBytes = await File.ReadAllBytesAsync(ofdPath);
+        var fileContent = new ByteArrayContent(fileBytes);
+        fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("application/octet-stream");
+        content.Add(fileContent, "file", "sample2.ofd");
+
+        var response = await client.PostAsync("/api/convert", content);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("application/pdf", response.Content.Headers.ContentType?.MediaType);
+
+        var pdfBytes = await response.Content.ReadAsByteArrayAsync();
+        Assert.NotEmpty(pdfBytes);
+        // PDF files start with the %PDF- header
+        Assert.Equal("%PDF-", System.Text.Encoding.ASCII.GetString(pdfBytes, 0, 5));
+    }
+
     [Fact]
     public async Task Post_NonOfdFile_ReturnsBadRequest()
     {
